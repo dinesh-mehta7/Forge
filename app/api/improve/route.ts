@@ -12,6 +12,21 @@ function sseEvent(type: string, payload: object): string {
   return `data: ${JSON.stringify({ type, ...payload })}\n\n`;
 }
 
+// ─── Request validation ───────────────────────────────────────────────────────
+// Validating here means a malformed request returns a clean 400 instead of
+// crashing partway through the stream with an unhandled type error.
+
+const requestSchema = z.object({
+  userId: z.string(),
+  workspaceId: z.string(),
+  userRequest: z.string().min(1),
+  fileData: z.object({
+    files: z.record(z.string(), z.object({ code: z.string() })),
+    dependencies: z.record(z.string(), z.string()),
+    title: z.string(),
+  }),
+});
+
 // ─── Route ────────────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -19,17 +34,34 @@ export async function POST(request: NextRequest) {
   if (!clerkId)
     return Response.json({ message: "Unauthorized" }, { status: 401 });
 
-  const body = await request.json();
-  const { userId, workspaceId, userRequest, fileData } = body as {
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return Response.json({ message: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const parsed = requestSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return Response.json(
+      { message: "Invalid request", issues: parsed.error.issues },
+      { status: 400 }
+    );
+  }
+
+  const { userId, workspaceId, userRequest, fileData } = parsed.data as {
     userId: string;
     workspaceId: string;
-    userRequest: string; // what the user wants improved
+    userRequest: string;
     fileData: FileData;
   };
 
   // ── Auth + credit check ────────────────────────────────────────────────────
+  // findFirst, not findUnique: (id, clerkId) together aren't a declared
+  // unique constraint, just an ownership check, so findUnique's stricter
+  // typing would reject this where-shape.
 
-  const user = await db.user.findUnique({
+  const user = await db.user.findFirst({
     where: { id: userId, clerkId },
     select: { id: true, credits: true, plan: true },
   });
@@ -50,8 +82,16 @@ export async function POST(request: NextRequest) {
 
   const stream = new ReadableStream({
     async start(controller) {
-      const enqueue = (chunk: string) =>
-        controller.enqueue(encoder.encode(chunk));
+      let closed = false;
+      const enqueue = (chunk: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          // Controller already closed/errored — stop trying to write.
+          closed = true;
+        }
+      };
 
       // Accumulate file patches as the agent calls update_file
       const patchedFiles: Record<string, { code: string }> = {
@@ -150,34 +190,32 @@ RULES:
         },
       });
 
+      // Capture the subscription handle so we can clean it up below.
+      // If agent.subscribe doesn't return an unsubscribe fn, this is just
+      // undefined and the optional call in `finally` is a no-op.
+      const unsubscribe = agent.subscribe((event) => {
+        if (event.type === "assistant-text-delta" && event.text) {
+          enqueue(sseEvent("thinking", { text: event.text }));
+        }
+
+        // This fires reliably every time a tool is called
+        if (event.type === "tool-started") {
+          const name = event.toolCall?.toolName;
+          if (name === "update_file") {
+            const path =
+              (event.toolCall?.input as { path?: string })?.path ?? "a file";
+            enqueue(
+              sseEvent("thinking", { text: `\n\nUpdating \`${path}\`…` })
+            );
+          } else if (name === "done_improving") {
+            enqueue(
+              sseEvent("thinking", { text: "\n\nFinalizing improvements…" })
+            );
+          }
+        }
+      });
+
       try {
-        // ── Stream agent reasoning to chat panel ─────────────────────────
-        // assistant-text-delta fires as the agent types its reasoning.
-        // We emit these as "thinking" events — shown in the chat panel
-        // as a live streaming message so users see the agent working.
-
-        agent.subscribe((event) => {
-          if (event.type === "assistant-text-delta" && event.text) {
-            enqueue(sseEvent("thinking", { text: event.text }));
-          }
-
-          // This fires reliably every time a tool is called
-          if (event.type === "tool-started") {
-            const name = event.toolCall?.toolName;
-            if (name === "update_file") {
-              const path =
-                (event.toolCall?.input as { path?: string })?.path ?? "a file";
-              enqueue(
-                sseEvent("thinking", { text: `\n\nUpdating \`${path}\`…` })
-              );
-            } else if (name === "done_improving") {
-              enqueue(
-                sseEvent("thinking", { text: "\n\nFinalizing improvements…" })
-              );
-            }
-          }
-        });
-
         // ── Run the agent ─────────────────────────────────────────────────
         enqueue(sseEvent("status", { message: "Cline agent starting…" }));
 
@@ -195,8 +233,12 @@ RULES:
           title: fileData.title,
         };
 
-        await db.$transaction([
-          db.workspace.update({
+        // updateMany, not update: (id, userId) isn't a declared unique
+        // constraint either, and updateMany lets us detect a 0-row result
+        // (wrong owner / missing workspace) instead of throwing or silently
+        // succeeding against the wrong row.
+        const [{ count: workspaceUpdated }] = await db.$transaction([
+          db.workspace.updateMany({
             where: { id: workspaceId, userId },
             data: { fileData: newFileData as never },
           }),
@@ -205,6 +247,10 @@ RULES:
             data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
           }),
         ]);
+
+        if (workspaceUpdated === 0) {
+          throw new Error("Workspace not found or not owned by this user");
+        }
 
         const updatedUser = await db.user.findUnique({
           where: { id: userId },
@@ -230,6 +276,8 @@ RULES:
           })
         );
       } finally {
+        unsubscribe?.();
+        closed = true;
         controller.close();
       }
     },
